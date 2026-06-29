@@ -36,14 +36,51 @@ Entreprise de mobilité (VTC, livraison) tracke 100K véhicules en temps réel.
 - Compression des séquences de points
 - Tradeoff précision spatiale vs performance
 
-## Structure attendue
+## Structure du Projet
 ```
 src/
 ├── simulator/          # Flotte 1000 véhicules
 ├── streaming/          # Spark Streaming → H3 → ClickHouse
 ├── batch/              # Airflow DAGs analytiques
 ├── api/                # Geofencing + ETA endpoints
-├── dashboard/          # Kepler.gl config
+├── kepler/             # Kepler.gl configuration
 ├── notebooks/          # Analyse et feature engineering
-└── docker-compose.yml
+tests/                  # Tests unitaires et d'intégration
+infra/                  # Configuration Terraform
 ```
+
+## Prise en Main & Lancement
+
+### 1. Démarrer l'infrastructure locale
+```bash
+docker-compose up -d
+```
+
+### 2. Déployer l'infrastructure Cloud avec Terraform
+```bash
+cd infra/terraform
+terraform init
+terraform apply -auto-approve
+```
+
+### 3. Lancer le simulateur de flotte de véhicules
+```bash
+python src/simulator/fleet_simulator.py
+```
+
+### 4. Lancer le job Spark Streaming d'agrégation H3
+```bash
+python src/streaming/h3_aggregation.py
+```
+
+### 5. Lancer l'API de Geofencing
+```bash
+uvicorn src.api.geofence_api:app --host 0.0.0.0 --port 8000
+```
+
+## Exécuter les Tests
+Les tests couvrent les fonctions H3, le simulateur, l'API et l'intégration :
+```bash
+pytest tests/
+```
+
