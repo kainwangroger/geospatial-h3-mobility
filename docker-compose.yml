@@ -1,0 +1,177 @@
+name: geospatial-h3
+
+volumes:
+  postgis-data:
+  clickhouse-data:
+  kafka-data:
+
+services:
+
+  # ── Kafka ──────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: geo-kafka
+    environment:
+      CLUSTER_ID: "geo-cluster-01"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_NUM_PARTITIONS: 6
+    ports:
+      - "9097:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-cluster.sh", "id", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── PostGIS ────────────────────────────────────
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: geo-postgis
+    environment:
+      POSTGRES_DB: geospatial
+      POSTGRES_USER: geo
+      POSTGRES_PASSWORD: geopass
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgis-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "geo", "-d", "geospatial"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── ClickHouse ─────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: geo-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # ── Spark ───────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.4
+    container_name: geo-spark-master
+    ports:
+      - "4043:4040"
+      - "7080:7077"
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+        --host spark-master --port 7077 --webui-port 4040
+
+  spark-worker:
+    image: apache/spark:3.5.4
+    container_name: geo-spark-worker
+    depends_on:
+      - spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+        spark://spark-master:7077 --webui-port 4041
+
+  # ── Jupyter + Kepler.gl ────────────────────────
+  jupyter:
+    image: jupyter/base-notebook:python-3.12
+    container_name: geo-jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./src/notebooks:/home/jovyan/work
+    command: >
+      start-notebook.sh
+        --NotebookApp.token='geo'
+        --NotebookApp.password=''
+
+  # ── Airflow ─────────────────────────────────────
+  airflow-db:
+    image: postgres:16-alpine
+    container_name: geo-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  airflow-webserver:
+    image: apache/airflow:2.10.3-python3.12
+    container_name: geo-airflow-webserver
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./src/batch/dags:/opt/airflow/dags:ro
+    ports:
+      - "8083:8080"
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.3-python3.12
+    container_name: geo-airflow-scheduler
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./src/batch/dags:/opt/airflow/dags:ro
+    command: scheduler
+
+  airflow-init:
+    image: apache/airflow:2.10.3-python3.12
+    container_name: geo-airflow-init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+    command: >
+      bash -c "airflow db migrate && airflow users create
+        --username admin --password admin --firstname Admin
+        --lastname User --role Admin --email admin@example.com
+        && echo 'Airflow initialized'"
+
+  # ── API ─────────────────────────────────────────
+  api:
+    image: python:3.12-slim
+    container_name: geo-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src/api:/app:ro
+    working_dir: /app
+    command: >
+      bash -c "pip install -q fastapi uvicorn && uvicorn geofence_api:app --host 0.0.0.0 --port 8000"
+    depends_on:
+      - postgis

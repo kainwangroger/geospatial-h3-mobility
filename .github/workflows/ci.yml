@@ -1,0 +1,107 @@
+name: CI — Geospatial H3 Mobility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest fastapi uvicorn httpx
+
+      - name: Lint Python code
+        run: ruff check src/ tests/ --ignore=E402,F811
+
+      - name: Check Python syntax
+        run: |
+          python -m py_compile src/simulator/fleet_simulator.py
+          python -m py_compile src/streaming/h3_utils.py
+          python -m py_compile src/api/geofence_api.py
+          python -m py_compile src/kepler/config.py
+          python -m py_compile src/notebooks/h3_analysis.py
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest fastapi uvicorn httpx
+
+      - name: Run tests
+        run: |
+          pytest tests/test_simulator.py tests/test_h3.py tests/test_geofence_api.py -v
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check docker-compose syntax
+        run: docker compose -f docker-compose.yml config
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests, docker-build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start core services
+        run: docker compose up -d kafka postgis clickhouse spark-master spark-worker --wait --wait-timeout 180
+
+      - name: List containers
+        run: docker compose ps
+
+      - name: Verify Kafka
+        run: |
+          docker compose exec -T kafka /opt/kafka/bin/kafka-cluster.sh id --bootstrap-server localhost:9092
+
+      - name: Verify PostGIS
+        run: |
+          docker compose exec -T postgis pg_isready -U geo -d geospatial
+
+      - name: Create Kafka topics
+        run: |
+          docker compose exec -T kafka \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --topic gps-positions --if-not-exists --partitions 6
+
+      - name: List Kafka topics
+        run: |
+          docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+      - name: Produce test GPS positions
+        run: |
+          docker compose exec -T kafka \
+            sh -c 'echo "{\"vehicle_id\":\"V00001\",\"type\":\"car\",\"lat\":48.8566,\"lon\":2.3522,\"speed\":35.0,\"timestamp\":\"2026-06-29T12:00:00Z\"}" | \
+            /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic gps-positions'
+
+      - name: Consume test GPS position
+        run: |
+          docker compose exec -T kafka \
+            /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+            --topic gps-positions --from-beginning --max-messages 1 --timeout-ms 10000
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
